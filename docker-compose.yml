@@ -1,0 +1,48 @@
+services:
+  postgres:
+    # pgvector image: identical to plain Postgres today, but Day 29 needs the
+    # vector extension, so using it now means no infrastructure change later.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: rag_user
+      POSTGRES_PASSWORD: rag_pass
+      POSTGRES_DB: ragdb
+    # No host port published: only the api container needs to reach Postgres,
+    # so it can't collide with another project's Postgres on port 5432.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag_user -d ragdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://rag_user:rag_pass@postgres:5432/ragdb
+      # Day 31: generation only -- embeddings need no key (local fastembed).
+      # ${VAR} is substituted from the host's .env by Docker Compose itself,
+      # which is more reliable than relying on the app to read .env from
+      # inside the built image (that bit us once already on this project).
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.groq.com/openai/v1}
+      LLM_MODEL: ${LLM_MODEL:-llama-3.1-8b-instant}
+    volumes:
+      # Day 29: fastembed downloads its ONNX model weights once (from
+      # Hugging Face) on first use. Without this volume, that download
+      # would repeat on every `docker compose down` + `up` cycle -- this
+      # persists the cache across container restarts.
+      - fastembed_cache:/root/.cache/fastembed
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+volumes:
+  pgdata:
+  fastembed_cache:

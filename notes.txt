@@ -1,0 +1,1 @@
+RAG retrieves relevant passages before answering. Vectors are stored in pgvector for similarity search. Bananas are rich in potassium.
