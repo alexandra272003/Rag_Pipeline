@@ -1,285 +1,198 @@
-# RAG Pipeline: built from scratch (Week 5)
+# RAG Pipeline — Week 5 (built from scratch)
 
-A retrieval-augmented generation (RAG) service built **without a framework**, so every step is visible: upload a document, split it into chunks, embed it locally, store the vectors in Postgres, then ask questions and get **cited, verified answers**.
-
-| Day | What was built | Status |
-|---|---|---|
-| 28 | Parse, clean and chunk documents; store with metadata | Done |
-| 29 | Local embeddings (fastembed) + pgvector column and index | Done |
-| 30 | Top-k retrieval with metadata filters (`POST /retrieve`) | Done |
-| 31 | Grounded answers with verified citations (`POST /ask`) | Done |
-| 32-34 | Evaluation set, chunk-size / top-k experiments, failure analysis | Next |
-
-## Architecture
+Week 5 builds retrieval-augmented generation without a framework, so every
+step is visible.
 
 ```
-INDEXING (once per document)
-  upload -> parse -> clean -> chunk -> embed (local) -> store in Postgres + pgvector
-
-QUERY (every question)
-  question -> embed (same model) -> top-k nearest chunks (+ filters)
-           -> numbered prompt -> LLM -> answer -> verify citations -> response
+Document -> parse -> clean -> chunk -> embed -> pgvector index      <- Day 29
+Question -> embed -> retrieve top-k (+ metadata filters)            <- Day 30
+         -> build prompt -> LLM -> cited, verified answer           <- Day 31
+Eval     -> 30-question frozen set -> Precision@k, Recall@k, MRR     <- Day 32 (this commit)
 ```
 
-| Piece | Where it runs | Needs a key? |
-|---|---|---|
-| Embeddings (`BAAI/bge-small-en-v1.5`, 384 dims) | Locally, via fastembed / ONNX Runtime | No |
-| Vector store | Postgres 16 + pgvector (Docker) | No |
-| Answer generation | OpenAI-compatible chat API (Groq by default) | **Yes**, `LLM_API_KEY` |
+## Run it
 
-## Quick start
-
-**Requirements:** Docker Desktop.
-
-1. Create your `.env` file next to `docker-compose.yml`:
-
-   ```dotenv
-   LLM_API_KEY=gsk_your_full_groq_key
-   LLM_BASE_URL=https://api.groq.com/openai/v1
-   LLM_MODEL=openai/gpt-oss-20b
-   ```
-
-   Get a key at console.groq.com. `.env` is git-ignored: never commit it or paste it anywhere public.
-
-2. Start everything:
-
-   ```bash
-   docker compose up --build
-   ```
-
-3. Open:
-   - **http://127.0.0.1:8000/** : the *chunk lab* (live chunk-size playground and file upload)
-   - **http://127.0.0.1:8000/docs** : interactive API docs (easiest way to try every endpoint)
-
-The **first upload is slow (10-30 s)**: fastembed downloads its ~130 MB model once. It is cached in a Docker volume, so later uploads and restarts are fast. Without a valid `LLM_API_KEY` everything works except `/ask`.
-
-After changing `.env`, restart so the container picks it up:
+No API key needed -- embeddings run locally (see below).
 
 ```bash
-docker compose down
 docker compose up --build
 ```
 
-## Try it
+The first document you upload will be slow (10-30s): fastembed downloads its
+~130MB model on first use. It's cached in a Docker volume afterward, so
+every upload after that is fast, and restarting the containers doesn't
+re-download it.
 
-**Bash / macOS / Linux**
+Open **http://127.0.0.1:8000/** — the *chunk lab*. Paste text and change chunk
+size / overlap to see chunks re-cut live (highlighted text is the overlap), or
+upload a `.txt`, `.md` or `.pdf` to run the real pipeline: parse, clean, chunk,
+embed, and store. The page is served by the API itself, so there is no CORS
+setup and nothing to build. API docs are at `/docs`.
 
-```bash
-# 1. upload
-curl -F "file=@notes.txt" "http://127.0.0.1:8000/documents?chunk_size=200&chunk_overlap=20"
+Tests need no Docker or API key: `pip install -r requirements.txt && pytest -v`
+(the embedding provider is mocked, same "fast fake" approach as every other
+provider call in this sprint).
 
-# 2. retrieve the closest chunks (no LLM involved)
-curl -X POST http://127.0.0.1:8000/retrieve -H "Content-Type: application/json" \
-  -d '{"query": "what does the chunk lab do?", "top_k": 3}'
+## What each stage does, and why
 
-# 3. ask a question (retrieval + LLM)
-curl -X POST http://127.0.0.1:8000/ask -H "Content-Type: application/json" \
-  -d '{"query": "what does the chunk lab do?", "top_k": 3}'
-```
+**Parse** (`ingestion/parsers.py`) — file bytes to pages. PDFs keep their page
+number; txt/md are a single page with no number.
 
-**Windows PowerShell** (plain `curl` is an alias for something else, so use `curl.exe`)
+**Clean** (`ingestion/cleaning.py`) — runs *before* chunking, so stored offsets
+refer to the text we actually keep. It undoes hard line-wrapping, repairs
+words split by a hyphen at a line break, folds ligatures (`ﬁ` -> `fi`) and
+non-breaking spaces with Unicode NFKC, and strips control characters. Noise left
+in here would end up inside embeddings and in the LLM's prompt.
 
-```powershell
-curl.exe -F "file=@notes.txt" "http://127.0.0.1:8000/documents?chunk_size=200&chunk_overlap=20"
+**Chunk** (`ingestion/chunking.py`) — packs whole sentences (or list/heading
+lines) into chunks up to `chunk_size` tokens, repeating the last
+`chunk_overlap` tokens at the start of the next chunk. A single sentence
+bigger than `chunk_size` falls back to being split by words.
 
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/retrieve -ContentType "application/json" `
-  -Body '{"query":"what does the chunk lab do?","top_k":3}'
+**Embed** (`core/embeddings.py`, Day 29) — every chunk's text is embedded
+LOCALLY via `fastembed` (ONNX Runtime, model `BAAI/bge-small-en-v1.5`, 384
+dimensions) and stored on the chunk row. This is the ONLY place in the app
+that generates embeddings, mirroring `llm_client.py` from the Week 4
+project: one place to swap the model, one place to mock in tests. Since
+fastembed is synchronous and CPU-bound, it runs in a worker thread
+(`asyncio.to_thread`) rather than blocking the event loop. A model failure
+is raised as `EmbeddingError` (502) — nothing is persisted for a document
+whose embeddings couldn't be generated.
 
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/ask -ContentType "application/json" `
-  -Body '{"query":"what does the chunk lab do?","top_k":3}'
-```
+**Why local instead of a hosted embeddings API:** no API key, no billing,
+no provider outage to handle, and no network dependency at request time —
+at the cost of somewhat lower embedding quality than a large hosted model,
+and a one-time ~130MB model download on first use (Groq, notably, has no
+embeddings endpoint at all, despite some third-party client libraries
+implying otherwise — chat, audio, and TTS only).
 
-The file must exist in the folder you run the command from (or use a full path).
+**Store** (`models/models.py`, `alembic/versions/8a1c2f9d4b3e_...py`) — the
+embedding lives in a real `pgvector` column on Postgres, with an `ivfflat`
+cosine-distance index built by the Day 29 migration
+(`CREATE EXTENSION vector`, then the index). In tests, the same column falls
+back to a plain JSON array under SQLite (`Vector(...).with_variant(JSON(),
+"sqlite")`), since pgvector has no SQLite backend — same data, no real
+Postgres or API key needed to run the suite.
 
-**Example `/ask` response**
+**Retrieve** (`services/retrieval_service.py`, `routers/retrieval.py`, Day 30)
+— `POST /retrieve` embeds the query with the same local model used at
+ingestion, then returns the `top_k` chunks with the smallest cosine
+distance. Metadata filters (`document_id`, `source_type`) narrow the
+candidate set *before* ranking, not after — so `top_k` comes from the
+filtered set instead of being padded out by irrelevant documents that
+happened to rank low. Deliberately no LLM call in this endpoint: keeping
+retrieval separate means its quality (did the right chunk come back at
+all?) can be evaluated independently of answer quality (Day 31+).
 
-```json
-{
-  "query": "What is this document about?",
-  "answer": "The document is a README for a software project ... [1][2][3]",
-  "citations": [
-    {"number": 1, "chunk_id": 4, "document_id": 1, "filename": "README.md",
-     "page_number": null, "distance": 0.399}
-  ],
-  "all_citations_valid": true,
-  "retrieved_count": 3
-}
-```
+On Postgres, the distance is computed *inside the database* via pgvector's
+cosine-distance operator, using the Day 29 `ivfflat` index — an approximate
+nearest-neighbor search, not a full scan, which is what makes this viable
+at real corpus sizes. The test suite (SQLite) has no pgvector operator to
+call, so it fetches the (test-scale) candidate rows and ranks them in
+Python instead — correct for a handful of rows, and a direct illustration
+of why the Postgres path needs an index rather than doing the same thing
+at scale.
 
-## API reference
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/documents` | Upload and ingest a `.txt`, `.md` or `.pdf` (max 10 MB) |
-| `GET` | `/documents` | List documents |
-| `GET` | `/documents/{id}` | One document |
-| `GET` | `/documents/{id}/chunks` | Its chunks, with page numbers and offsets |
-| `DELETE` | `/documents/{id}` | Delete a document and its chunks (`204`) |
-| `POST` | `/chunk-preview` | Chunk text without saving (powers the chunk lab) |
-| `POST` | `/retrieve` | Top-k nearest chunks, with filters |
-| `POST` | `/ask` | Full pipeline: retrieve, generate, verify citations |
-| `GET` | `/ping` | Health check |
-
-**`POST /documents`** query parameters: `chunk_size` (default 500, range 5-4000) and `chunk_overlap` (default 50, must be smaller than `chunk_size`). The upload is a multipart form field named `file`.
-
-**`POST /retrieve` and `POST /ask`** request body:
-
-| Field | Type | Default | Notes |
-|---|---|---|---|
-| `query` | string | required | 1-2000 characters |
-| `top_k` | int | 5 | 1-50 |
-| `document_id` | int | none | Only search this document |
-| `source_type` | string | none | `"pdf"`, `"txt"` or `"md"` |
-
-`/retrieve` returns `results[]` with `chunk_id`, `document_id`, `filename`, `chunk_index`, `page_number`, `content` and `distance`. **`distance` is cosine distance: smaller is more relevant** (0 = identical direction, 2 = opposite). It is deliberately not converted to a "confidence" score.
-
-`/ask` returns `answer`, `citations[]`, `all_citations_valid` and `retrieved_count`.
-
-### Errors
-
-Every failure uses one shape: `{"error": {"code": "...", "message": "...", "details": {...}}}`.
-
-| Status | `code` | When |
-|---|---|---|
-| 404 | `not_found` | Unknown document id |
-| 409 | `duplicate_document` | Same file already ingested with the same chunk settings (`details.existing_document_id`) |
-| 413 | `payload_too_large` | File over 10 MB |
-| 415 | `unsupported_file_type` | Not `.txt`, `.md` or `.pdf` |
-| 422 | `invalid_document` | Empty file, unreadable or encrypted PDF, or no extractable text (scanned PDFs need OCR) |
-| 422 | `invalid_chunk_params` | `chunk_overlap >= chunk_size` |
-| 502 | `embedding_error` | The local embedding model failed |
-| 502 | `provider_error` | The LLM call failed (`details.reason` has the provider's message) |
-
-## Configuration
-
-Set these in `.env`. Settings are read by the app (`app/core/config.py`).
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `LLM_API_KEY` | placeholder | Key for the chat provider |
-| `LLM_BASE_URL` | `https://api.groq.com/openai/v1` | Any OpenAI-compatible endpoint |
-| `LLM_MODEL` | `llama-3.1-8b-instant` in code | **Set `openai/gpt-oss-20b`** (see Troubleshooting) |
-| `LLM_TIMEOUT_SECONDS` | 30 | Per-request timeout |
-| `LLM_MAX_RETRIES` | 2 | Retries on timeouts, connection errors, 429 and 5xx |
-| `LLM_RETRY_BACKOFF_SECONDS` | 0.5 | Doubles each retry |
-| `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Local embedding model |
-| `EMBEDDING_DIMENSIONS` | 384 | Must match the model **and** the database column |
-| `EMBEDDING_BATCH_SIZE` | 64 | Texts per embedding batch |
-| `DEFAULT_CHUNK_SIZE` / `DEFAULT_CHUNK_OVERLAP` | 500 / 50 | Used when the upload does not specify them |
-| `MAX_UPLOAD_BYTES` | 10 MB | Upload cap |
-
-In Docker, `docker-compose.yml` forwards only `DATABASE_URL`, `LLM_API_KEY`, `LLM_BASE_URL` and `LLM_MODEL` into the container. To change any other variable in Docker, add it under `api: environment:` in the compose file.
-
-## Project structure
-
-```
-app/
-  main.py                    FastAPI app, routers, error handler
-  core/
-    config.py                settings (env / .env)
-    db.py                    async SQLAlchemy engine and session
-    embeddings.py            the ONLY place that generates embeddings
-    llm_client.py            the ONLY place that calls the chat LLM (retries live here)
-    errors.py                domain errors -> one JSON error shape
-  ingestion/                 pure Python: no HTTP, no database
-    parsers.py               bytes -> pages (PDF keeps page numbers)
-    cleaning.py              noise removal before chunking
-    chunking.py              sentence-packed chunks with overlap and offsets
-  models/models.py           Document and Chunk tables (+ pgvector column)
-  repositories/              database access
-  services/
-    ingestion_service.py     validate, dedupe, parse, chunk, embed, store
-    retrieval_service.py     embed query, nearest-neighbour search, filters
-    generation_service.py    prompt, LLM call, citation verification
-  routers/                   HTTP layer (documents, retrieval, ask, lab)
-  static/chunk-lab.html      chunk playground UI
-alembic/versions/            schema migrations (pgvector extension + index)
-tests/                       60 tests, no Docker or API key needed
-```
-
-## How it works
-
-**Parse** (`ingestion/parsers.py`): file bytes to pages. PDFs keep their page number; txt/md are one page with no number.
-
-**Clean** (`ingestion/cleaning.py`): runs *before* chunking, so stored offsets refer to the text actually kept. It undoes hard line-wrapping, repairs words split by a hyphen at a line break, folds ligatures and non-breaking spaces (Unicode NFKC) and strips control characters. Noise left here would end up inside embeddings and in the LLM prompt.
-
-**Chunk** (`ingestion/chunking.py`): packs whole sentences (or list/heading lines) into chunks of up to `chunk_size` tokens, repeating the last `chunk_overlap` tokens at the start of the next chunk. A single sentence larger than `chunk_size` falls back to being split by words. Chunks never span pages, so a citation's page number is exact.
-
-**Embed** (`core/embeddings.py`): every chunk is embedded locally with `BAAI/bge-small-en-v1.5` (384 dimensions) and stored on its row. fastembed is synchronous and CPU-bound, so it runs in a worker thread (`asyncio.to_thread`) instead of blocking the event loop. The model is loaded once per process.
-
-**Store** (`models/models.py`, Alembic migration `8a1c2f9d4b3e`): the embedding is a real pgvector column with an `ivfflat` cosine-distance index. Under SQLite (tests only) the same column falls back to a JSON array via `Vector(...).with_variant(JSON(), "sqlite")`.
-
-**Retrieve** (`services/retrieval_service.py`): the query is embedded with the same model, then Postgres returns the `top_k` chunks with the smallest cosine distance using pgvector's operator. On the SQLite test path the candidates are ranked in Python instead.
-
-**Generate** (`services/generation_service.py`): retrieved chunks are numbered and labelled, for example `[1] (handbook.pdf, page 4)`. The system prompt tells the model to answer only from that context, say "I don't know based on the provided documents." when it cannot, and cite every claim as `[N]`.
-
-**Verify**: a model told never to invent a citation can still do it, so every `[N]` in the answer is checked against the chunks that were really retrieved. An invalid number is dropped from `citations` and sets `all_citations_valid` to `false`. If nothing is retrieved, the LLM is **not called at all** and the refusal is deterministic.
-
-## Design decisions and trade-offs
-
-- **Local embeddings instead of a hosted API.** No key, no billing, no outage to retry against, no network call at request time. Cost: somewhat lower quality than a large hosted model, a one-time ~130 MB download, and CPU load on your own server.
-- **Embed before saving; one failure rejects the whole document.** A half-embedded document is worse than a clean retry. Cost: a large upload takes longer and cannot resume partway.
-- **Embeddings and the LLM are separate, single-purpose modules.** One place to swap a provider and one place to mock in tests.
-- **Retrieval is its own endpoint with no LLM.** Whether the right chunk came back can be evaluated independently of whether the model used it well.
-- **Distance, not a similarity score.** It is honest about what the metric is.
-- **ivfflat vs exact search.** ivfflat is approximate: it trades a little recall for speed at scale. `lists = 100` is a placeholder to revisit once real data volume is known (Day 33).
-- **`SET LOCAL ivfflat.probes = 100`.** ivfflat probes only 1 of its `lists` clusters by default. On a small corpus that one cluster can miss every real match, so the query succeeds and returns *nothing*, with no error. Setting probes to 100 (equal to `lists`) fixes it. `SET LOCAL` applies to the current transaction only, so it cannot leak onto a pooled connection. With probes equal to `lists`, the search effectively scans every cluster; for a larger corpus, lower it and measure recall.
-- **Chunk size.** Small chunks are precise but may lack context. Large chunks carry context but blur several topics into one embedding and use more of the LLM's context window. Overlap protects an answer that straddles a boundary, at the cost of more chunks and near-duplicate results.
-- **Duplicate protection.** The key is the SHA-256 of the file plus the chunk settings, so the same file can be ingested at different chunk sizes (needed for the Day 33 experiments) but not twice at the same size.
-
-## Tests
+**A real bug caught and fixed while building this:** the first version
+returned zero results against a real, populated Postgres database, with
+no error at all. The cause was `ivfflat`'s `lists`/`probes` trade-off: the
+Day 29 index splits the table into `lists = 100` clusters and, by
+default, a search probes only **1** of them. On a small corpus (a handful
+of documents, nowhere near 100 rows worth of real clustering), that one
+probed cluster can easily contain none of the actual nearest vectors —
+so the query runs successfully and returns nothing, which is a much
+harder failure to notice than an error would be. Fixed with
+`SET LOCAL ivfflat.probes = 100` before the query, scoped to that one
+transaction so it can't leak onto a pooled connection reused by another
+request. The trade-off: more probes means slower (but more accurate)
+search — the right number for a real corpus depends on its size and
+would be revisited once actual data volume is known, exactly the kind of
+tuning the Day 33 chunk-size/top-k experiment log is for.
 
 ```bash
-pip install -r requirements.txt
-pytest -v
+curl -X POST http://127.0.0.1:8000/retrieve \
+  -H "Content-Type: application/json" \
+  -d '{"query": "what does the chunk lab do?", "top_k": 3}'
 ```
 
-60 tests, no Docker, API key or model download needed. The suite runs on SQLite with the embedding model and the LLM mocked.
+**Answer with citations** (`services/generation_service.py`, `routers/ask.py`,
+Day 31) — `POST /ask` runs the full pipeline: retrieve top-k chunks, build a
+prompt that numbers and labels each one with its source (`[1] (handbook.pdf,
+page 4)`), instruct the model to answer only from that numbered context and
+cite every claim, then generate the answer.
 
-**Known test gap:** the pgvector SQL path (the distance operator, the ivfflat index, `SET LOCAL ivfflat.probes`) is not exercised by the suite, because SQLite has no vector operators. Verify it manually against the running Postgres, or add an integration test against the compose Postgres.
+This needs a real LLM, unlike embeddings — set `LLM_API_KEY` in `.env` (see
+`.env.example`; defaults to Groq's chat endpoint, which is a genuinely
+supported Groq feature, unlike their nonexistent embeddings endpoint). If
+retrieval finds nothing, the LLM is never called at all: the refusal
+("I don't know based on the provided documents.") is deterministic, not
+hoped-for from the model.
 
-**Keep tests offline:** `mock_embeddings` in `tests/conftest.py` must patch **both** call sites. Add this line next to the existing patch, otherwise tests that call `/retrieve` or `/ask` without `install_topic_embeddings` load the real model and need internet:
+**The citations are verified, not trusted.** A model told "never cite a
+number that isn't in the context" can still do it anyway, so every `[N]` in
+the answer is checked against the chunks that were actually retrieved.
+A fabricated citation is dropped from the structured `citations` list and
+flips `all_citations_valid` to `false` — the response tells you plainly
+whether the model's citations can be trusted, rather than assuming they
+can.
 
-```python
-monkeypatch.setattr("app.services.retrieval_service.embed_texts", fake_embed_texts)
+```bash
+curl -X POST http://127.0.0.1:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query": "what does the chunk lab do?", "top_k": 3}'
 ```
 
-## Troubleshooting
+**Evaluation** (`eval/`, Day 32) — `eval/eval_set.json` is a frozen set of 30
+questions (10 factoid, 6 paraphrased, 6 loosely/ambiguously worded, 8
+no-answer) against a small synthetic 3-document corpus
+(`eval/corpus/`: a leave policy, a product FAQ, and a page of science
+facts — picked specifically so the three are topically disjoint and
+cross-document retrieval mistakes are obvious). Each labeled question is
+tagged with its correct source document and an exact short phrase
+(`gold_span`) that must appear in a correct retrieval.
 
-| Symptom | Cause and fix |
-|---|---|
-| PowerShell: `A parameter cannot be found that matches parameter name 'F'` | `curl` is a PowerShell alias. Use `curl.exe`, or `Invoke-RestMethod`. |
-| `curl: (26) Failed to open/read local data from file` | The file does not exist in the current folder. Create it or pass a full path. |
-| `/ask` returns `provider_error` with `401 Invalid API Key` | The key is wrong, truncated or revoked. Put the full key in `.env`, then `docker compose down` and `up --build`. Check what the container received: `docker compose exec api printenv LLM_API_KEY`. |
-| `/ask` returns `provider_error` with `404 model_not_found` | The model is retired or unavailable to your key. Groq retired `llama-3.1-8b-instant` for developer-tier use; set `LLM_MODEL=openai/gpt-oss-20b`. To list models your key can use: `docker compose exec api python -c "import os,json,urllib.request as u; r=u.Request('https://api.groq.com/openai/v1/models',headers={'Authorization':'Bearer '+os.environ['LLM_API_KEY'],'User-Agent':'curl/8'}); print([m['id'] for m in json.loads(u.urlopen(r).read())['data']])"` |
-| First upload takes 10-30 s | Normal: the embedding model downloads once and is then cached. |
-| `/retrieve` returns zero results on a populated database | The ivfflat probes setting (see Design decisions). It is already set to 100 in the code. |
-| `409 duplicate_document` | That file was already ingested with these chunk settings. Use the id in `details.existing_document_id`, or upload with different settings. |
-| `curl: not found` inside the container | The image has no `curl`. Use `python -c ...` as shown above. |
+`eval/run_eval.py` ingests the corpus, runs retrieval for every labeled
+question, checks whether `gold_span` shows up in the top-k results, and
+prints Precision@k, Recall@k, and MRR — overall and broken down by
+question type. No-answer questions are reported separately (there's no
+single "correct chunk" to score them against); instead it prints each
+one's top-1 distance, so you can eyeball whether there's a gap that could
+become a similarity threshold later.
 
-## Known limitations
+```bash
+docker compose cp eval api:/code/eval
+docker compose exec api python eval/run_eval.py
+```
 
-These are real gaps, listed so they are not a surprise:
+**Why a single-relevant-item simplification, and why that's named
+explicitly:** each question is scored against exactly one correct
+passage, found by exact substring match, rather than a human-labeled set
+of every passage that could answer it. This keeps the eval set cheap to
+build and exactly reproducible, at the cost of not capturing questions
+with multiple valid answers. Every number this script prints should be
+read with that trade-off in mind — which is itself a legitimate thing to
+say out loud in an interview, rather than presenting the metrics as more
+rigorous than they are.
 
-- **No context token budget.** Retrieved chunks are sent to the LLM without any limit. A large `top_k` times a large `chunk_size` could exceed the model's context or rate limits and surface as a `502`.
-- **Retrieved text is not fenced off as untrusted.** A document containing instructions ("ignore the above...") could try to steer the model. Delimit the context clearly and tell the model to treat it as data.
-- **No relevance threshold.** Retrieval always returns the `top_k` nearest chunks, even for an off-topic question, so the model is then relied on to refuse. A maximum-distance cutoff would let the app refuse deterministically.
-- **Sampling is not set on the LLM call** (no `temperature` or `max_tokens`), so answers can vary between runs. A low temperature suits grounded Q&A.
-- **Approximate token counting.** `chunk_size` is counted with a simple word-and-punctuation counter, which undercounts real model tokens. The embedding model accepts roughly 512 tokens, so a default 500-"token" chunk may be truncated when embedded. Prefer a smaller `chunk_size` or switch to the model's real tokenizer.
-- **`lists = 100` is created on an empty table.** ivfflat builds its clusters from the data present at creation, so create or rebuild the index after loading data (`REINDEX`) and size `lists` to the corpus.
-- **Parsing and chunking run on the event loop** (embedding already runs in a thread). Large files can slow other requests.
-- **Embedding happens inside the upload request.** Fine for small files; large ones belong in a background job.
-- **No OCR** (scanned PDFs are rejected), **no table or multi-column layout handling**, and **no authentication**.
+`run_eval.py` takes `--chunk-size`, `--chunk-overlap`, and `--top-k` as
+command-line flags specifically so Day 33's chunk-size × k experiment
+grid can call this exact script repeatedly with different values, rather
+than being written from scratch.
 
-## Security
+## The trade-offs (the interview-relevant part)
 
-- Keep `LLM_API_KEY` only in `.env`; it is git-ignored. If a key is ever pasted into chat, a screenshot or a commit, revoke it and create a new one.
-- Treat uploaded documents as untrusted input (see the limitations above).
-- Postgres is not published on a host port; only the API container can reach it.
-
-## Next (Days 32-34)
-
-1. A 30-50 question evaluation set, labelled by document, page and answer span (not chunk id, which changes with chunk settings).
-2. Metrics: Precision@k, Recall@k and MRR, plus tokens and latency per query.
-3. Experiment grid: chunk size 250 / 500 / 1000 against top-k 3 / 5 / 10.
-4. Failure analysis and the 10-minute oral defence.
+- **Chunk size.** Small chunks are precise but may lack the context to answer
+  anything. Large chunks carry context but blur several topics into one
+  embedding, so a match no longer tells you *which* part was relevant; they also
+  spend more of the LLM's context window per retrieved chunk.
+- **Overlap.** Protects against an answer straddling a boundary. Costs storage
+  and embedding work (more chunks) and can return near-duplicate results.
+- **Batching embeddings.** Fewer HTTP round-trips and lower latency per
+  document, at the cost of one failure (after retries) discarding the whole
+  document's ingestion rather than partially embedding it. Chosen because a
+  half-embedded document is worse than a clean retry.
+- **ivfflat vs exact search.** ivfflat is approximate — it trades a small
+  amount of recall for speed at scale, unlike a brute-force scan over every
+  vector. `lists = 100` is a placeholder; the right value depends on corpus
+  size and gets revisited once real data volume is known (Day 30 retrieval
+  evaluation touches this directly).

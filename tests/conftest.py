@@ -65,7 +65,17 @@ def mock_embeddings(monkeypatch):
     async def fake_embed_texts(texts):
         return [[0.0] * settings.embedding_dimensions for _ in texts]
 
+    # Both call sites need patching -- ingestion AND retrieval each import
+    # embed_texts separately (`from app.core.embeddings import embed_texts`
+    # binds a new name in each importing module), so patching only one
+    # leaves the other making a real model call. This was a real gap:
+    # every retrieval-side query embedding was silently hitting the real
+    # local model (and real network, to download it on first use) even
+    # when this fixture was "mocking" embeddings -- only caught because a
+    # network-restricted environment made it fail loudly instead of just
+    # running slow.
     monkeypatch.setattr("app.services.ingestion_service.embed_texts", fake_embed_texts)
+    monkeypatch.setattr("app.services.retrieval_service.embed_texts", fake_embed_texts)
     return fake_embed_texts
 
 

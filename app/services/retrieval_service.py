@@ -25,6 +25,7 @@ async def retrieve(
     top_k: int = 5,
     document_id: int | None = None,
     source_type: str | None = None,
+    document_ids: list[int] | None = None,
 ) -> list[tuple[Chunk, str, float]]:
     """
     Day 30: top-k retrieval with metadata filters.
@@ -35,6 +36,12 @@ async def retrieve(
     (document_id, source_type) narrow the candidate set BEFORE ranking,
     not after, so top_k results come from the filtered set rather than
     being padded out by irrelevant documents that happened to rank low.
+
+    document_ids (plural) is a Day 32 addition for the evaluation script
+    only -- it scopes retrieval to a specific set of documents (the eval
+    corpus) so measured results aren't diluted by whatever else happens to
+    be sitting in the same database from manual testing. Not exposed on
+    the public /retrieve or /ask request schemas; internal use only.
 
     Returns (Chunk, filename, distance) tuples, sorted by distance
     ascending (closest first).
@@ -55,6 +62,8 @@ async def retrieve(
     base_stmt = select(Chunk, Document.filename).join(Document, Chunk.document_id == Document.id)
     if document_id is not None:
         base_stmt = base_stmt.where(Chunk.document_id == document_id)
+    if document_ids is not None:
+        base_stmt = base_stmt.where(Chunk.document_id.in_(document_ids))
     if source_type is not None:
         base_stmt = base_stmt.where(Document.source_type == source_type)
 
