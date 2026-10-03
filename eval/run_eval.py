@@ -42,13 +42,25 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.db import SessionLocal  # noqa: E402
 from app.core.errors import DuplicateDocumentError  # noqa: E402
+from app.ingestion.chunking import count_tokens  # noqa: E402
 from app.services import ingestion_service, retrieval_service  # noqa: E402
+from app.services.generation_service import SYSTEM_PROMPT  # noqa: E402
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    """Nearest-rank percentile -- no numpy dependency needed for 22 data points."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, round(pct / 100 * (len(s) - 1))))
+    return s[k]
 
 CORPUS_DIR = Path(__file__).resolve().parent / "corpus"
 EVAL_SET_PATH = Path(__file__).resolve().parent / "eval_set.json"
@@ -101,21 +113,52 @@ async def run(chunk_size: int, chunk_overlap: int, top_k: int) -> None:
     async with SessionLocal() as session:
         doc_ids_by_name = await ingest_corpus(session, chunk_size, chunk_overlap)
         corpus_doc_ids = list(doc_ids_by_name.values())
-        print(f"Eval corpus ready: {doc_ids_by_name}")
-        print(f"Settings: chunk_size={chunk_size} chunk_overlap={chunk_overlap} top_k={top_k}\n")
+
+        from sqlalchemy import func, select as sa_select
+        from app.models import Chunk
+        total_chunks = (
+            await session.execute(
+                sa_select(func.count()).select_from(Chunk).where(Chunk.document_id.in_(corpus_doc_ids))
+            )
+        ).scalar()
+
+        print(f"Eval corpus ready: {doc_ids_by_name} ({total_chunks} chunks total)")
+        print(f"Settings: chunk_size={chunk_size} chunk_overlap={chunk_overlap} top_k={top_k}")
+        if total_chunks < top_k:
+            print(
+                f"NOTE: corpus has only {total_chunks} chunks total, fewer than top_k={top_k} -- "
+                f"every Precision@{top_k} figure below is mechanically capped at {total_chunks}/{top_k}, "
+                f"not a retrieval failure."
+            )
+        print()
 
         labeled = [q for q in questions if q["gold_span"] is not None]
         no_answer = [q for q in questions if q["gold_span"] is None]
 
         per_type_scores: dict[str, list[dict]] = {}
         all_scores: list[dict] = []
+        latencies_ms: list[float] = []
+        prompt_token_counts: list[int] = []
+        system_prompt_tokens = count_tokens(SYSTEM_PROMPT)
 
         for q in labeled:
+            t0 = time.perf_counter()
             results = await retrieval_service.retrieve(
                 session, q["question"], top_k=top_k, document_ids=corpus_doc_ids
             )
+            latencies_ms.append((time.perf_counter() - t0) * 1000)
+
             contents = [chunk.content for chunk, _filename, _distance in results]
             s = score_question(q["gold_span"], contents, top_k)
+
+            # Approximates the Day 31 prompt: system instructions + the
+            # question + every retrieved chunk's own stored token_count
+            # (captured once at ingestion, in app/ingestion/chunking.py).
+            # This is what a bigger chunk_size or top_k actually costs.
+            retrieved_tokens = sum(chunk.token_count for chunk, _f, _d in results)
+            prompt_token_counts.append(
+                system_prompt_tokens + count_tokens(q["question"]) + retrieved_tokens
+            )
 
             score = {"id": q["id"], "type": q["type"], "recall": s["recall"],
                       "precision": s["precision"], "mrr": s["mrr"]}
@@ -148,6 +191,18 @@ async def run(chunk_size: int, chunk_overlap: int, top_k: int) -> None:
             f"MRR={_avg(all_scores, 'mrr'):.3f}"
         )
 
+        avg_latency_ms = sum(latencies_ms) / len(latencies_ms) if latencies_ms else 0.0
+        p95_latency_ms = _percentile(latencies_ms, 95)
+        avg_prompt_tokens = (
+            sum(prompt_token_counts) / len(prompt_token_counts) if prompt_token_counts else 0.0
+        )
+        print(
+            f"\n  Cost/speed: avg_retrieval_latency={avg_latency_ms:.1f}ms  "
+            f"p95_retrieval_latency={p95_latency_ms:.1f}ms  "
+            f"avg_prompt_tokens={avg_prompt_tokens:.1f}  "
+            f"(system_prompt alone = {system_prompt_tokens} tokens)"
+        )
+
         if no_answer:
             print("\n" + "=" * 72)
             print(f"NO-ANSWER QUESTIONS ({len(no_answer)}) -- reported separately, not in the")
@@ -168,12 +223,16 @@ async def run(chunk_size: int, chunk_overlap: int, top_k: int) -> None:
             "chunk_size": chunk_size,
             "chunk_overlap": chunk_overlap,
             "top_k": top_k,
+            "total_chunks_in_corpus": total_chunks,
             "overall": {
                 "precision": _avg(all_scores, "precision"),
                 "recall": _avg(all_scores, "recall"),
                 "mrr": _avg(all_scores, "mrr"),
                 "n_labeled": len(all_scores),
                 "n_no_answer": len(no_answer),
+                "avg_retrieval_latency_ms": avg_latency_ms,
+                "p95_retrieval_latency_ms": p95_latency_ms,
+                "avg_prompt_tokens": avg_prompt_tokens,
             },
             "by_type": {
                 qtype: {

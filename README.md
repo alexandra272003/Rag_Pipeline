@@ -1,13 +1,17 @@
-# RAG Pipeline — Week 5 (built from scratch)
+# RAG Pipeline — Week 5 (built from scratch, complete)
 
 Week 5 builds retrieval-augmented generation without a framework, so every
-step is visible.
+step is visible. **Days 28-34 are all done** — ingestion through evaluation,
+plus the Day 34 failure analysis and oral defense write-up at
+[`docs/WEEK5_DEFENSE.md`](docs/WEEK5_DEFENSE.md).
 
 ```
 Document -> parse -> clean -> chunk -> embed -> pgvector index      <- Day 29
 Question -> embed -> retrieve top-k (+ metadata filters)            <- Day 30
          -> build prompt -> LLM -> cited, verified answer           <- Day 31
-Eval     -> 30-question frozen set -> Precision@k, Recall@k, MRR     <- Day 32 (this commit)
+Eval     -> 30-question frozen set -> Precision@k, Recall@k, MRR     <- Day 32
+Grid     -> chunk_size x top_k, 9 runs, one variable at a time       <- Day 33
+Defense  -> failure analysis + 10-minute oral defense script         <- Day 34 (this commit)
 ```
 
 ## Run it
@@ -177,7 +181,44 @@ rigorous than they are.
 `run_eval.py` takes `--chunk-size`, `--chunk-overlap`, and `--top-k` as
 command-line flags specifically so Day 33's chunk-size × k experiment
 grid can call this exact script repeatedly with different values, rather
-than being written from scratch.
+than being written from scratch. It also tracks retrieval latency
+(average and p95) and an estimated prompt token count per question
+(`system prompt + question + every retrieved chunk's stored token_count`),
+both written into `eval/results_latest.json` alongside the quality metrics.
+
+**Chunk-size × top-k grid** (`eval/run_grid.py`, Day 33) — calls
+`run_eval.py`'s `run()` nine times, once per combination of
+`chunk_size ∈ {250, 500, 1000}` × `top_k ∈ {3, 5, 10}`, holding overlap at
+a fixed 10% of chunk_size so it never becomes a hidden third variable.
+Everything else — the eval set, the embedding model, the prompt — stays
+identical across all nine runs, which is the one rule Day 33 actually
+insists on: change one thing at a time (or the full grid at once), never
+let two variables move together, or a result can't be attributed to a
+cause.
+
+```bash
+docker compose cp eval api:/code/eval
+docker compose exec api python eval/run_grid.py
+```
+
+Prints a single summary table (Precision@k, Recall@k, MRR, average prompt
+tokens, p95 latency, for all nine cells) and writes `eval/grid_results.json`
+for later comparison. Each document gets re-ingested fresh at every new
+chunk_size — Day 28's dedupe key is content hash *plus* chunk settings, so
+a different chunk_size is correctly treated as a new ingestion, not a
+duplicate; this is the dedupe design working as intended, not a special
+case for the grid.
+
+**A known artifact in this specific grid, named rather than hidden:** the
+eval corpus is 3 short synthetic documents. At `chunk_size=1000`, each
+document becomes only 1-2 chunks — fewer than `top_k=10` can even return.
+Precision@10 on that row is mechanically capped at (total chunks)/10, not
+a genuine signal about retrieval quality at that setting; the script
+prints a `NOTE` line whenever this applies, and the grid summary repeats
+the reminder at the bottom. Reading a metric without checking whether its
+denominator assumption holds is a very easy mistake to make, and worth
+calling out explicitly rather than presenting a misleading number
+cleanly.
 
 ## The trade-offs (the interview-relevant part)
 
